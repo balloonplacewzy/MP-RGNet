@@ -146,26 +146,6 @@ class WeatherPowerStateReconstructionHead(nn.Module):
 
 
 class WindowMeteoReliabilityGraphSmoother(nn.Module):
-    """
-    One-window meteorological similarity graph correction.
-
-    Design target:
-        - Build one N x N graph per input window, not one graph per time step.
-        - Keep only top-k meteorologically similar neighbors.
-        - Apply one neighbor weighted average to p_restore.
-        - Use reliability only as a conservative residual gate.
-        - Do not feed auxiliary features directly to the forecast head.
-
-    Inputs:
-        p_restore:   [B, L, N]
-        reliability: [B, L, N]
-        obs_mask:    [B, L, N]
-        aux:         [B, L, N, K]
-
-    Output:
-        p_graph:     [B, L, N]
-        scale:       scalar tensor
-    """
 
     def __init__(self, configs):
         super().__init__()
@@ -207,19 +187,15 @@ class WindowMeteoReliabilityGraphSmoother(nn.Module):
         # aux_selected: [B, L, N, K_g]
         aux_selected = aux.index_select(dim=-1, index=self.aux_indices)
 
-        # One representation per window and site. Mean captures weather level;
-        # std captures intra-window change. Shape: [B, N, 2 * K_g]
         aux_mean = aux_selected.mean(dim=1)
         aux_std = aux_selected.std(dim=1, unbiased=False)
         feat = torch.cat([aux_mean, aux_std], dim=-1)
 
-        # Normalize across sites inside each sample window so that one feature
-        # scale does not dominate the meteorological similarity graph.
         feat_mean = feat.mean(dim=1, keepdim=True)
         feat_std = feat.std(dim=1, keepdim=True, unbiased=False).clamp_min(self.eps)
         feat = (feat - feat_mean) / feat_std
 
-        # L2 normalization makes matmul equivalent to cosine similarity.
+        # L2 normalization 
         feat = feat / feat.norm(dim=-1, keepdim=True).clamp_min(self.eps)
         return feat
 
@@ -285,15 +261,11 @@ class WindowMeteoReliabilityGraphSmoother(nn.Module):
             scale = self.max_scale * torch.sigmoid(self.gate_logit)
             return p_restore, scale
 
-        # The graph is built from weather, but the graph itself should not become
-        # another learnable path that disturbs the reconstruction head semantics.
+
         neighbor_idx, base_weight = self._topk_similarity_graph(aux.detach())
 
         rel = reliability.detach().clamp(0.0, 1.0)
         mask = obs_mask.detach().clamp(0.0, 1.0)
-
-        # Reliable observed sites are better sources. This is window-level so the
-        # neighbor graph does not fluctuate at every time step.
         source_quality = (mask * rel).mean(dim=1)  # [B, N]
         src_q = torch.gather(
             source_quality,
@@ -311,8 +283,6 @@ class WindowMeteoReliabilityGraphSmoother(nn.Module):
 
         src_p = self._gather_neighbors(p_restore.detach(), neighbor_idx)
         p_neigh = (src_p * neighbor_weight.unsqueeze(1)).sum(dim=-1)
-
-        # Low-reliability observed values and missing values receive more graph correction.
         target_uncertainty = 1.0 - mask * rel
 
         unc_threshold = float(getattr(self, "unc_threshold", 0.5))
@@ -332,10 +302,6 @@ class WindowMeteoReliabilityGraphSmoother(nn.Module):
 
 
 class moving_avg(nn.Module):
-    """
-    Moving average block to highlight the trend of time series
-    """
-
     def __init__(self, kernel_size, stride):
         super(moving_avg, self).__init__()
         self.kernel_size = kernel_size
@@ -352,10 +318,6 @@ class moving_avg(nn.Module):
 
 
 class series_decomp(nn.Module):
-    """
-    Series decomposition block
-    """
-
     def __init__(self, kernel_size):
         super(series_decomp, self).__init__()
         self.moving_avg = moving_avg(kernel_size, stride=1)
@@ -366,10 +328,6 @@ class series_decomp(nn.Module):
         return res, moving_mean
 
 class AntiNoiseTemporalForecastHead(nn.Module):
-    """
-    Minimal temporal head kept only to satisfy the existing training interface,
-    which requires model_output['pred'].
-    """
 
     def __init__(self, configs):
         super().__init__()
@@ -403,18 +361,6 @@ class AntiNoiseTemporalForecastHead(nn.Module):
         return out
 
 class Model(nn.Module):
-    """
-    Restore-first wrapper.
-
-    Expected input:
-        x = [pv_obs_N, obs_mask_N, aux_N*K]
-
-    Returned tensors:
-        pred:        [B, pred_len, N]
-        p_impute:    [B, seq_len, N]
-        p_base:      [B, seq_len, N]
-        reliability: [B, seq_len, N]
-    """
 
     def __init__(self, configs):
         super().__init__()
