@@ -12,7 +12,7 @@ class BaseFullConfig:
 
         self.scenario_name = "mixed_10"
         self.model_type = "baseline"
-        self.impute_method = "forward_fill"
+        self.impute_method = "knn_fill"
 
 
         self.aux_layout = "feature_major"
@@ -360,12 +360,8 @@ class newmodelAUXGRAPHConfig(BaseFullConfig):
         self.task_name = "long_term_forecast"
         self.model_type = "ours"
         self.impute_method = "auto"
-
-
         self.seq_len = 96
         self.pred_len = 48
-
-
         self.target_dim = 227
         self.enc_out = 227
         self.aux_per_site = 7
@@ -384,8 +380,6 @@ class newmodelAUXGRAPHConfig(BaseFullConfig):
         self.grad_clip = 1.0
         self.loss = "mae"
         self.dropout = 0.1
-
-
         self.hidden_size = 128
 
 
@@ -395,16 +389,7 @@ class newmodelAUXGRAPHConfig(BaseFullConfig):
         self.restore_kernel_var = 5
         self.restore_dilations = (1, 2, 4)
         self.restore_dropout = 0.1
-        self.restore_site_emb_scale = 0.02
-
-
-        self.use_meteo_graph = False
-
-
         self.meteo_graph_aux_indices = tuple(range(self.aux_per_site))
-        self.meteo_graph_exclude_swr = False
-
-
         self.meteo_graph_topk = 3
         self.meteo_graph_max_scale = 0.01
         self.meteo_graph_temperature = 0.8
@@ -412,7 +397,6 @@ class newmodelAUXGRAPHConfig(BaseFullConfig):
         self.meteo_graph_delta_clip = 2.0
         self.meteo_graph_topk = 3
         self.meteo_graph_init_logit = -8.0
-
 
         self.restore_only = False
         self.detach_pred_for_restore = True
