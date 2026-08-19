@@ -55,19 +55,7 @@ class De_Patch_Embedding(nn.Module):
 
 
 class Model(nn.Module):
-    """
-    CrossLinear adapted for your Stage-1 framework.
 
-    Key design:
-    1. Use configs.enc_in as the real input feature dimension.
-       - No-aux version: args.enc_in = args.target_dim
-       - Aux version   : args.enc_in = args.total_features
-    2. Use configs.target_dim as the final forecast dimension.
-       - The first target_dim columns are treated as target variables.
-    3. Ignore configs.dec_in and the old MS logic.
-       - The original CrossLinear used configs.dec_in as input channels,
-         which conflicts with your two main_stage1 files.
-    """
 
     def __init__(self, configs):
         super(Model, self).__init__()
