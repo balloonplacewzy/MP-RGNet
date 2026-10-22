@@ -57,11 +57,7 @@ Available horizons are `8`, `16`, `24`, and `48`; scenarios are `mixed_10`, `mix
 
 ## Train a new backbone
 
-The original reconstruction/forecasting training entry is also included:
-
-```bash
-python main_ours.py --model_name newmodelAUXGRAPH --scenario_name mixed_10 --pred_len_override 8 --seed_override 2026
-```
+The original reconstruction/forecasting training entry is also included.
 
 The checkpoint is saved under `checkpoint_quality/`. Pass its path as `--backbone PATH_TO_CHECKPOINT` to the fine-tuning command above. Use a backbone trained for the same horizon and scenario.
 
