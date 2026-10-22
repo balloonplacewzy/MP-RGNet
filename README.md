@@ -47,11 +47,12 @@ Replace `--run h8/mixed_10` with `--all` to evaluate all 12 conditions. The outp
 
 ## Train from a supplied backbone
 
-```bash
 python train_single_seed.py --horizon 8 --scenario mixed_10 --seed 2026 --device cuda --output results/train_h8_mixed10
 ```
 
 This starts from `backbone.pth` and runs graph warm-up, the configured joint optimization, quality calibration, and graph adaptation. The joint optimization recipe depends on the horizon and scenario; some conditions retain the warm-up result without additional joint updates. Stage-specific validation rules determine the retained checkpoints. Settings are read from the two JSON files in the corresponding `runs/` directory. The final checkpoint is saved as `best.pt` in the output directory. Choose a new output directory for each run.
+
+Fine-tuning seeds share the pretrained backbone for their scenario–horizon condition and use `data_seed=2026`. Graph warm-up freezes the pretrained core; quality calibration updates the state-error estimator; graph adaptation updates the graph module while keeping the other components fixed. The per-condition files specify the training budgets and joint optimization recipe. Validation selection still applies to checkpoints and, for H24/H48, to three quality-reweighting configurations: `(longgap, 0.5)`, `(all, 0.1)`, and `(all, 0.5)`. In `longgap` mode, quality reweighting is restricted to sites with a missing run of at least 24 steps (6 h). Final quality settings are saved in each checkpoint.
 
 Available horizons are `8`, `16`, `24`, and `48`; scenarios are `mixed_10`, `mixed_20`, and `mixed_30`. Add `--smoke` for a short execution check using small subsets and reduced epochs.
 
