@@ -47,6 +47,7 @@ Replace `--run h8/mixed_10` with `--all` to evaluate all 12 conditions. The outp
 
 ## Train from a supplied backbone
 
+```bash
 python train_single_seed.py --horizon 8 --scenario mixed_10 --seed 2026 --device cuda --output results/train_h8_mixed10
 ```
 
