@@ -2,25 +2,33 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import argparse
+import hashlib
+import json
+from numbers import Integral, Real
+from pathlib import Path
+from importlib.metadata import version
+import platform
 from typing import Dict, Optional, Tuple, Any
 from sklearn.impute import KNNImputer
 
 
-AUX_DELAY_STEPS = 4         # one-hour delay for 15-minute resolution auxiliary features
+AUX_DELAY_STEPS = 4                                                                     
+DATA_PROTOCOL_VERSION = "pv-quality-v2"
+DATA_OPTION_FIELDS = ("aux_delay_steps", "missing_pattern", "block_len", "data_seed", "append_obs_mask")
 
 
-# ============================================================
-# Scenario definitions
-# ------------------------------------------------------------
-# Principle:
-#   1. The original CSV is always treated as clean ground truth.
-#   2. The scenario only corrupts the historical input x.
-#   3. The prediction target y is always the clean future PV power.
-#   4. PV primary features are never time-delayed.
-#   5. Meteorological auxiliary features are always delayed by 4 steps,
-#      i.e., one hour for 15-minute resolution data.
-# ============================================================
+
+
+
+
+
+
+
+
+
+
 
 SCENARIOS: Dict[str, Dict[str, Any]] = {
     "clean": {
@@ -105,17 +113,147 @@ class PVDataConfig:
     day_threshold: float
     scale: bool
 
-    # KNN imputation settings.
-    # Only used when impute_method == "knn".
+
+
     knn_n_neighbors: int = 5
     knn_weights: str = "distance"
 
-    # Layout of raw auxiliary columns in the CSV.
-    # feature_major: aux_0_site_0..aux_0_site_N, aux_1_site_0..aux_1_site_N, ...
-    # unit_major:    site_0_aux_0..site_0_aux_K, site_1_aux_0..site_1_aux_K, ...
-    # The dataloader always converts auxiliary inputs to unit_major before
-    # concatenating them into x, so models can reshape aux as [B, L, N, K].
+
+
+
+
+
     aux_layout: str = "feature_major"
+
+    aux_delay_steps: Optional[int] = None
+    missing_pattern: Optional[str] = None
+    block_len: Optional[int] = None
+    data_seed: Optional[int] = None
+    append_obs_mask: Optional[bool] = None
+
+
+def _integer(value, name, minimum=0):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+
+
+def _finite_number(value, name, minimum=0.0, upper=None):
+    if (isinstance(value, (bool, np.bool_)) or not isinstance(value, Real)
+            or not np.isfinite(value) or value < minimum or (upper is not None and value >= upper)):
+        raise ValueError(f"Invalid {name}={value!r}; expected finite value >= {minimum}"
+                         + (f" and < {upper}" if upper is not None else ""))
+
+
+def validate_missing_parameters(missing_rate, missing_pattern, block_len):
+    _finite_number(missing_rate, "missing_rate", upper=1.0)
+    if missing_pattern not in ("none", "random_point", "block", "station"):
+        raise ValueError(f"Unknown missing_pattern={missing_pattern!r}")
+    _integer(block_len, "block_len", minimum=1)
+
+
+def resolve_scenario(cfg, scenario_override=None):
+
+    scenario = get_scenario(cfg.scenario_name)
+    scenario.setdefault("block_len", 8)
+    for key in ("aux_delay_steps", "missing_pattern", "block_len"):
+        value = getattr(cfg, key)
+        if value is not None:
+            scenario[key] = value
+    if scenario_override is not None:
+        if not isinstance(scenario_override, dict):
+            raise ValueError("scenario_override must be a dict")
+        unknown = set(scenario_override) - set(scenario)
+        if unknown:
+            raise ValueError(f"Unknown scenario_override fields: {sorted(unknown)}")
+        scenario.update(scenario_override)
+    _integer(scenario["aux_delay_steps"], "aux_delay_steps")
+    _finite_number(scenario["noise_std"], "noise_std")
+    validate_missing_parameters(scenario["missing_rate"], scenario["missing_pattern"], scenario["block_len"])
+    return {key: (int(value) if key in ("aux_delay_steps", "block_len") else
+                  float(value) if key in ("noise_std", "missing_rate") else value)
+            for key, value in scenario.items()}
+
+
+def degradation_generators(data_seed):
+
+    _integer(data_seed, "data_seed")
+    return tuple(np.random.Generator(np.random.PCG64(
+        np.random.SeedSequence(int(data_seed), spawn_key=(stream_id,))))
+        for stream_id in (0, 1))
+
+
+def describe_missingness(obs_mask, train_end, val_end, block_mode):
+
+    result = {}
+    for name, start, end in (("train", 0, train_end), ("val", train_end, val_end),
+                             ("test", val_end, len(obs_mask))):
+        missing = obs_mask[start:end] < 0.5
+        stats = {"start": start, "end": end, "missing_count": int(missing.sum()),
+                 "actual_missing_rate": float(missing.mean()) if missing.size else None}
+        if block_mode:
+            lengths = []
+            for site in range(missing.shape[1]):
+                edges = np.diff(np.pad(missing[:, site].astype(np.int8), (1, 1)))
+                lengths.extend((np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)).tolist())
+            stats.update(run_count=len(lengths), mean_run_length=float(np.mean(lengths)) if lengths else 0.0,
+                         max_run_length=max(lengths, default=0))
+        result[name] = stats
+    return result
+
+
+def add_data_arguments(parser):
+    parser.add_argument("--aux_delay_steps", type=int, default=None)
+    parser.add_argument("--missing_pattern", choices=["none", "random_point", "block", "station"], default=None)
+    parser.add_argument("--block_len", type=int, default=None,
+                        help="Length of each placed block, not final merged runs.")
+    parser.add_argument("--data_seed", type=int, default=None)
+    parser.add_argument("--append_obs_mask", action=argparse.BooleanOptionalAction, default=None,
+                        help="Only controls mask concatenation into x; use --no-append_obs_mask to disable.")
+    parser.add_argument("--aux_layout", choices=["feature_major", "unit_major"], default=None)
+
+
+def validate_model_data_interface(args, meta):
+
+    if args.model_name == "newmodelAUXGRAPH" and not meta["append_obs_mask"]:
+        raise ValueError("newmodelAUXGRAPH requires append_obs_mask=True: input is [PV, obs_mask, aux].")
+    if args.model_type == "baseline" and meta["input_dim"] != args.enc_in:
+        raise ValueError(f"Model enc_in={args.enc_in}, but dataset input_dim={meta['input_dim']}. "
+                         "Mask concatenation does not adapt the model; check the input configuration.")
+
+
+def prepare_run_outputs(args, meta):
+
+    dataset_name = Path(args.data).stem
+    checkpoint_dir = Path(args.checkpoint_root) / DATA_PROTOCOL_VERSION / dataset_name / args.scenario_name
+    result_dir = Path(args.result_root) / DATA_PROTOCOL_VERSION / dataset_name / args.scenario_name
+    stage = f"_stage-{args.stage}" if hasattr(args, "stage") else ""
+    run_identifier = (f"{args.model_name}_type-{args.model_type}{stage}_scenario-{args.scenario_name}"
+                      f"_imp-{args.impute_method}_len{args.seq_len}-{args.pred_len}_seed{args.seed}"
+                      f"_data-{meta['data_config_id']}")
+    paths = {
+        "checkpoint_path": checkpoint_dir / f"{run_identifier}.pth",
+        "first_step_csv_path": result_dir / f"{run_identifier}_first_step.csv",
+        "overlap_avg_csv_path": result_dir / f"{run_identifier}_overlap_avg.csv",
+        "config_path": result_dir / f"{run_identifier}_config.json",
+        "metrics_csv_path": result_dir / "metrics_summary.csv",
+    }
+    for key, path in paths.items():
+        if key != "metrics_csv_path" and path.exists():
+            raise FileExistsError(f"Refusing to overwrite existing run artifact: {path}")
+    args.run_identifier = run_identifier
+    record = {"run_identifier": run_identifier, "data_protocol_version": DATA_PROTOCOL_VERSION,
+              "data_config_id": meta["data_config_id"], "effective_data_config": meta["effective_data_config"],
+              "requested_data_config": meta["requested_data_config"], "arguments": vars(args),
+              "missing_statistics": meta["missing_statistics"],
+              "missing_statistics_boundary": meta["missing_statistics_boundary"],
+              "environment": {"python": platform.python_version(),
+                              **{name: version(name) for name in ("numpy", "pandas", "torch", "scikit-learn")}}}
+    serialized = json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    with paths["config_path"].open("x", encoding="utf-8") as handle:
+        handle.write(serialized)
+    return paths
 
 
 class StandardScaler:
@@ -158,19 +296,21 @@ def get_scenario(scenario_name: str) -> Dict[str, Any]:
 
 
 def time_delay(data: np.ndarray, delay_steps: int) -> np.ndarray:
-    """
-    Apply causal time delay:
-        delayed[t] = data[t - delay_steps]
 
-    For the first delay_steps samples, the earliest available value is used.
-    This avoids using future information.
-    """
-    if delay_steps <= 0:
+
+
+
+
+
+
+    _integer(delay_steps, "delay_steps")
+    if delay_steps == 0 or len(data) == 0:
         return data.copy()
 
     delayed = np.empty_like(data)
     delayed[:delay_steps] = data[0:1]
-    delayed[delay_steps:] = data[:-delay_steps]
+    if delay_steps < len(data):
+        delayed[delay_steps:] = data[:-delay_steps]
     return delayed.astype(np.float32)
 
 
@@ -181,23 +321,23 @@ def add_daytime_gaussian_noise(
     day_threshold: float,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Add Gaussian noise only to daytime PV values.
 
-    The noise is added in the scaled space. Daytime is judged using raw PV power:
-        day_mask = pv_obs_raw > day_threshold
 
-    Args:
-        pv_obs_scaled: observed PV input without power delay, shape [T, N]
-        pv_obs_raw: raw PV input without power delay, shape [T, N]
-        noise_std: std of Gaussian noise in scaled space
-        day_threshold: raw PV value threshold for daytime
-        rng: numpy random generator
 
-    Returns:
-        pv_noisy_scaled: noisy PV input, shape [T, N]
-        day_mask: daytime mask, shape [T, N], 1 for daytime and 0 for nighttime
-    """
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     day_mask = (pv_obs_raw > day_threshold).astype(np.float32)
 
     if noise_std <= 0:
@@ -220,19 +360,18 @@ def generate_missing_mask(
     rng: np.random.Generator,
     block_len: int = 8,
 ) -> np.ndarray:
-    """
-    Generate observed mask for PV power.
 
-    Returns:
-        obs_mask: shape [T, N], 1 for observed and 0 for missing.
-    """
+
+
+
+
+
     T, N = shape
-
-    if missing_rate <= 0 or missing_pattern == "none":
+    _integer(T, "T", minimum=1)
+    _integer(N, "N", minimum=1)
+    validate_missing_parameters(missing_rate, missing_pattern, block_len)
+    if missing_rate == 0 or missing_pattern == "none":
         return np.ones((T, N), dtype=np.float32)
-
-    if not 0.0 <= missing_rate < 1.0:
-        raise ValueError(f"missing_rate should be in [0, 1), got {missing_rate}")
 
     if missing_pattern == "random_point":
         missing = rng.random((T, N)) < missing_rate
@@ -274,12 +413,12 @@ def apply_missing(pv_obs_scaled: np.ndarray, obs_mask: np.ndarray) -> np.ndarray
 
 
 def causal_forward_fill(data: np.ndarray, initial_values: np.ndarray) -> np.ndarray:
-    """
-    Causal forward filling for missing values.
 
-    It never uses future values. If the first value is missing, it uses initial_values.
-    This is safer than pandas ffill().bfill() for time-series experiments.
-    """
+
+
+
+
+
     filled = data.copy().astype(np.float32)
     last = initial_values.astype(np.float32).copy()
 
@@ -299,29 +438,29 @@ def knn_impute_with_train_fit(
     n_neighbors: int = 5,
     weights: str = "distance",
 ) -> Tuple[np.ndarray, Optional[Any]]:
-    """
-    KNN imputation for PV missing values.
 
-    Important:
-        The KNN imputer is fitted only on the training split to avoid data leakage.
-        Then it transforms the full sequence using the train-fitted imputer.
 
-    Args:
-        data:
-            PV observation with NaNs, shape [T, num_sites].
-        train_end:
-            End index of training split.
-        n_neighbors:
-            Number of nearest neighbors.
-        weights:
-            'uniform' or 'distance'.
 
-    Returns:
-        imputed_data:
-            KNN-imputed PV observation, shape [T, num_sites].
-        imputer:
-            Fitted KNNImputer, or None if no NaN exists.
-    """
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     if not np.isnan(data).any():
         return data.astype(np.float32), None
 
@@ -336,7 +475,7 @@ def knn_impute_with_train_fit(
 
     train_data = data[:train_end].astype(np.float32)
 
-    # Fallback for extreme cases where an entire PV station is missing in training.
+
     train_col_mean = np.nanmean(train_data, axis=0).astype(np.float32)
     train_col_mean = np.nan_to_num(train_col_mean, nan=0.0).astype(np.float32)
 
@@ -351,13 +490,13 @@ def knn_impute_with_train_fit(
         metric="nan_euclidean",
     )
 
-    # Fit only on training split.
+
     imputer.fit(safe_data[:train_end])
 
-    # Transform the whole sequence using the train-fitted imputer.
+
     imputed_data = imputer.transform(safe_data).astype(np.float32)
 
-    # Final safety check.
+
     imputed_data = np.nan_to_num(imputed_data, nan=0.0).astype(np.float32)
 
     return imputed_data, imputer
@@ -368,16 +507,16 @@ def fill_missing_values(
     method: str,
     train_initial_values: np.ndarray,
 ) -> np.ndarray:
-    """
-    Fill NaN values for conventional baselines or for numerical model input.
 
-    Supported non-KNN methods:
-        - forward_fill: causal forward filling
-        - zero: replace NaN with 0
-        - train_mean: replace NaN with training mean values
 
-    KNN is handled separately by knn_impute_with_train_fit(), because it needs train_end.
-    """
+
+
+
+
+
+
+
+
     if not np.isnan(data).any():
         return data.astype(np.float32)
 
@@ -400,6 +539,9 @@ def fill_missing_values(
 
 
 def validate_config(cfg: PVDataConfig):
+    _integer(cfg.seed if cfg.data_seed is None else cfg.data_seed, "effective data_seed")
+    if cfg.append_obs_mask is not None and not isinstance(cfg.append_obs_mask, (bool, np.bool_)):
+        raise ValueError("append_obs_mask must be None, True or False")
     if not 0.0 < cfg.train_ratio < 1.0:
         raise ValueError(f"train_ratio should be in (0, 1), got {cfg.train_ratio}")
 
@@ -421,8 +563,8 @@ def validate_config(cfg: PVDataConfig):
             f"impute_method should be one of {valid_impute_methods}, got {cfg.impute_method}."
         )
 
-    # For ours/proposed models, do not use KNN and keep missing-value placeholders as zero-filled
-    # PV values paired with explicit observation masks.
+
+
     if cfg.model_type == "ours" and cfg.impute_method != "zero":
         raise ValueError(
             "model_type='ours' requires impute_method='zero'. "
@@ -462,20 +604,20 @@ def reorder_auxiliary_features(
     aux_layout: str,
     aux_columns: Optional[list] = None,
 ) -> Tuple[np.ndarray, Optional[list], int]:
-    """
-    Convert raw auxiliary columns to unit-major order for model input.
 
-    Supported raw layouts:
-        feature_major:
-            [aux_0_site_0 ... aux_0_site_N, aux_1_site_0 ... aux_1_site_N, ...]
-        unit_major:
-            [site_0_aux_0 ... site_0_aux_K, site_1_aux_0 ... site_1_aux_K, ...]
 
-    Returned aux is always unit-major:
-        [site_0_aux_0 ... site_0_aux_K, site_1_aux_0 ... site_1_aux_K, ...]
 
-    Therefore, models can safely reshape the auxiliary part as [B, L, N, K].
-    """
+
+
+
+
+
+
+
+
+
+
+
     aux_raw = aux_raw.astype(np.float32)
     total_len, aux_dim = aux_raw.shape
 
@@ -593,14 +735,14 @@ class PVQualityDataset(Dataset):
         )
 
         batch = {
-            "x": torch.from_numpy(x),                    # baseline: [seq_len, num_sites + aux_dim], ours: [seq_len, num_sites + num_sites + aux_dim]
-            "y": torch.from_numpy(y),                    # [pred_len, num_sites]
-            "pv_obs": torch.from_numpy(pv_obs),          # [seq_len, num_sites]
-            "obs_mask": torch.from_numpy(obs_mask),      # [seq_len, num_sites]
-            "pv_clean": torch.from_numpy(pv_clean_hist), # [seq_len, num_sites], clean historical PV (scaled)
-            "day_mask": torch.from_numpy(day_mask),      # [seq_len, num_sites]
-            "quality": torch.from_numpy(quality),        # [3]: [noise_std, missing_rate, aux_delay_steps]
-            "y_raw": torch.from_numpy(y_raw),            # [pred_len, num_sites]
+            "x": torch.from_numpy(x),                                                                                                                
+            "y": torch.from_numpy(y),                                           
+            "pv_obs": torch.from_numpy(pv_obs),                                
+            "obs_mask": torch.from_numpy(obs_mask),                            
+            "pv_clean": torch.from_numpy(pv_clean_hist),                                                     
+            "day_mask": torch.from_numpy(day_mask),                            
+            "quality": torch.from_numpy(quality),                                                         
+            "y_raw": torch.from_numpy(y_raw),                                   
             "index": torch.tensor(s, dtype=torch.long),
         }
 
@@ -611,45 +753,37 @@ def build_pv_quality_dataloaders(
     cfg: PVDataConfig,
     scenario_override: Optional[Dict[str, Any]] = None,
 ):
-    """
-    Build train/val/test dataloaders for PV quality scenarios.
 
-    Data assumption:
-        - The first cfg.num_sites columns are clean PV power.
-        - The remaining columns are auxiliary features.
-        - For your current dataset: 227 PV columns + 7 * 227 auxiliary columns.
-        - Your raw CSV auxiliary columns are feature-major by default:
-          aux_0_site_0 ... aux_0_site_226, aux_1_site_0 ... aux_1_site_226, ...
-        - This dataloader converts auxiliary features to unit-major order before
-          concatenating them into x:
-          site_0_aux_0 ... site_0_aux_6, site_1_aux_0 ... site_1_aux_6, ...
-          Therefore model code can reshape the auxiliary part as [B, L, N, 7].
 
-    Output convention:
-        x: historical corrupted input, shape [B, seq_len, input_dim]
-        y: clean future PV target, shape [B, pred_len, num_sites]
 
-    For missing-data scenarios:
-        - PV observations are first corrupted by missing masks.
-        - If impute_method == "knn", KNNImputer is fitted only on the training split.
-        - The fitted imputer then transforms train/val/test to avoid data leakage.
 
-    PV primary features are not time-delayed. Auxiliary features are always
-    causally delayed by AUX_DELAY_STEPS, which corresponds to one hour for
-    15-minute resolution data.
-    """
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     validate_config(cfg)
 
-    scenario = get_scenario(cfg.scenario_name)
-    if scenario_override is not None:
-        scenario.update(scenario_override)
-
-    # PV primary features are never delayed. Auxiliary features are fixed to a
-    # one-hour delay. Keep this assignment after scenario_override so that no
-    # external scenario can silently change the auxiliary delay setting.
-    scenario["aux_delay_steps"] = AUX_DELAY_STEPS
-
-    rng = np.random.default_rng(cfg.seed)
+    scenario = resolve_scenario(cfg, scenario_override)
+    data_seed = int(cfg.seed if cfg.data_seed is None else cfg.data_seed)
+    noise_rng, missing_rng = degradation_generators(data_seed)
 
     df = pd.read_csv(cfg.csv_path)
     all_data = df.values.astype(np.float32)
@@ -678,53 +812,54 @@ def build_pv_quality_dataloaders(
         pv_scaler = IdentityScaler()
         aux_scaler = IdentityScaler()
 
-    # Fit scalers only on training split.
+
     pv_scaler.fit(pv_raw[:train_end])
     aux_scaler.fit(aux_raw[:train_end])
 
     pv_scaled = pv_scaler.transform(pv_raw).astype(np.float32)
     aux_scaled = aux_scaler.transform(aux_raw).astype(np.float32)
 
-    # ------------------------------------------------------------
-    # 1. PV primary observation.
-    #    The main PV feature is not delayed. Only noise and missingness are
-    #    applied to the historical PV input.
-    # ------------------------------------------------------------
+
+
+
+
+
     pv_obs_scaled = pv_scaled.copy().astype(np.float32)
     pv_obs_raw = pv_raw.copy().astype(np.float32)
 
-    # ------------------------------------------------------------
-    # 2. Daytime-only noise on PV observation.
-    #    Noise is added in scaled space.
-    # ------------------------------------------------------------
+
+
+
+
     noise_std = float(scenario["noise_std"])
     pv_obs_scaled, day_mask = add_daytime_gaussian_noise(
         pv_obs_scaled=pv_obs_scaled,
         pv_obs_raw=pv_obs_raw,
         noise_std=noise_std,
         day_threshold=cfg.day_threshold,
-        rng=rng,
+        rng=noise_rng,
     )
 
-    # ------------------------------------------------------------
-    # 3. Missing PV observation.
-    #    For clean/noise scenarios, obs_mask is all ones.
-    # ------------------------------------------------------------
+
+
+
+
     obs_mask = generate_missing_mask(
         shape=pv_obs_scaled.shape,
         missing_rate=float(scenario["missing_rate"]),
         missing_pattern=str(scenario["missing_pattern"]),
-        rng=rng,
+        rng=missing_rng,
+        block_len=scenario["block_len"],
     )
     pv_obs_with_nan = apply_missing(pv_obs_scaled, obs_mask)
 
-    # ------------------------------------------------------------
-    # 4. Fill missing PV input.
-    #    baseline:
-    #       missing/mixed can use KNN (fit on train split only), or other methods.
-    #    ours/proposed model:
-    #       only zero fill is allowed; explicit obs_mask is appended into x.
-    # ------------------------------------------------------------
+
+
+
+
+
+
+
     train_initial_values = np.nanmean(pv_obs_with_nan[:train_end], axis=0).astype(np.float32)
     train_initial_values = np.nan_to_num(train_initial_values, nan=0.0).astype(np.float32)
 
@@ -743,19 +878,19 @@ def build_pv_quality_dataloaders(
             train_initial_values=train_initial_values,
         )
 
-    # ------------------------------------------------------------
-    # 5. Auxiliary features are always delayed by 4 steps.
-    #    They are not sparse and not missing in your current setting.
-    # ------------------------------------------------------------
+
+
+
+
     aux_delay_steps = int(scenario["aux_delay_steps"])
     aux_model_input = time_delay(aux_scaled, aux_delay_steps)
 
-    # ------------------------------------------------------------
-    # 6. Final model input and clean target.
-    #    baseline x: [pv_model_input, aux_model_input]
-    #    ours     x: [pv_model_input, obs_mask, aux_model_input]
-    # ------------------------------------------------------------
-    append_obs_mask = (cfg.model_type == "ours")
+
+
+
+
+
+    append_obs_mask = (cfg.model_type == "ours") if cfg.append_obs_mask is None else bool(cfg.append_obs_mask)
     if append_obs_mask:
         x_full = np.concatenate([pv_model_input, obs_mask, aux_model_input], axis=1).astype(np.float32)
     else:
@@ -865,6 +1000,28 @@ def build_pv_quality_dataloaders(
         "aux_scaler": aux_scaler,
         "knn_imputer": knn_imputer,
     }
+
+
+    effective = {
+        "data_protocol_version": DATA_PROTOCOL_VERSION,
+        "csv_sha256": hashlib.sha256(Path(cfg.csv_path).read_bytes()).hexdigest(),
+        "data_seed": data_seed, **scenario,
+        "append_obs_mask": append_obs_mask, "impute_method": cfg.impute_method,
+        "knn_n_neighbors": int(cfg.knn_n_neighbors), "knn_weights": cfg.knn_weights,
+        "num_sites": int(cfg.num_sites), "aux_layout": cfg.aux_layout,
+        "scale": bool(cfg.scale), "day_threshold": float(cfg.day_threshold),
+        "train_ratio": float(cfg.train_ratio), "val_ratio": float(cfg.val_ratio),
+        "total_len": total_len, "train_end": train_end, "val_end": val_end,
+    }
+    config_id = hashlib.sha256(json.dumps(effective, sort_keys=True, separators=(",", ":"),
+                                         allow_nan=False).encode("utf-8")).hexdigest()[:12]
+    meta.update(data_seed=data_seed, data_protocol_version=DATA_PROTOCOL_VERSION,
+                data_config_id=config_id, effective_data_config=effective,
+                requested_data_config=asdict(cfg),
+                missing_statistics=describe_missingness(obs_mask, train_end, val_end,
+                                                       scenario["missing_pattern"] == "block"),
+                missing_statistics_boundary="Per-site runs clipped to each [start, end) split; "
+                                            "a run crossing a boundary is counted in both intervals.")
 
     return train_loader, val_loader, test_loader, meta
 
