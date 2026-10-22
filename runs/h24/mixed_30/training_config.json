@@ -1,0 +1,44 @@
+{
+  "seed": 2026,
+  "data_seed": 2026,
+  "backbone_seed": 2026,
+  "batch_size": 16,
+  "grad_clip": 1.0,
+  "num_threads": 4,
+  "num_workers": 0,
+  "use_amp": false,
+  "optimizer": {
+    "name": "AdamW",
+    "weight_decay": 1e-05,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08
+  },
+  "warmup": {
+    "epochs": 8,
+    "lr": 0.001,
+    "windows": 1536,
+    "guard_weight": 0.5,
+    "history_weight": 0.05
+  },
+  "joint": {
+    "candidate": "control_warmup_b050"
+  },
+  "quality": {
+    "lr": 0.001,
+    "epochs": 6,
+    "train_windows": 2048,
+    "validation_windows": 192
+  },
+  "graph": {
+    "lr": 1e-05,
+    "epochs": 6,
+    "windows": 2048,
+    "forecast_guard_weight": 0.5,
+    "reconstruction_weight": 0.5,
+    "quality_gap_steps": 24,
+    "message_bound": 0.5
+  }
+}
